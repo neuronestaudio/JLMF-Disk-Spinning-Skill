@@ -1,0 +1,16 @@
+{
+  "sourceFile": "source.png",
+  "disc": { "cx": 0.5016, "cy": 0.3898, "r": 0.2269 },
+  "arm": {
+    "pivot": [0.652, 0.271],
+    "pivotRadius": 0.052,
+    "counterweight": [0.667, 0.207],
+    "counterweightRadius": 0.033,
+    "elbow": [0.6474, 0.2806],
+    "head": [0.5797, 0.4880],
+    "tubeRadius": 0.0075,
+    "headRadius": 0.020,
+    "padPx": 6,
+    "featherPx": 2
+  }
+}

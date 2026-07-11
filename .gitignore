@@ -1,0 +1,8 @@
+node_modules/
+out/
+public/source.*
+public/background.png
+public/vinyl.png
+public/tonearm.png
+*.log
+.DS_Store
