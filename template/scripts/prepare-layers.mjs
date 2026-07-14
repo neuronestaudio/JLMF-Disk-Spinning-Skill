@@ -1,14 +1,24 @@
 // Slices public/source.png into three 1920x1080 layers:
 //   background.png - the untouched photo (everything static)
-//   vinyl.png      - the circular record only, tonearm digitally removed &
-//                    refilled, transparent elsewhere (this layer rotates)
+//   vinyl.png      - the circular record only, tonearm + its cast shadow removed
+//                    & refilled, transparent elsewhere (this layer rotates)
 //   tonearm.png    - ONLY the arm's true silhouette (accurate alpha), static, on top
 //
-// The arm alpha = geometric corridor (localises the arm) INTERSECT an
-// arm-colour test (dark metal + specular glints, rejecting bright record art
-// and warm deck), then blurred + re-thresholded to remove speckles and give a
-// clean anti-aliased edge. The SAME alpha drives the vinyl refill, so the disc
-// keeps maximum original art and only the thin strip under the arm is donor-filled.
+// The arm alpha = geometric corridor (localises the arm) INTERSECT an arm-colour
+// test (dark metal + specular glints, rejecting bright record art and warm deck),
+// blurred + re-thresholded for a clean anti-aliased edge. This tight alpha is what
+// gets PASTED on top (tonearm.png).
+//
+// The vinyl refill uses a WIDER "fill" mask = arm alpha PLUS a geometric shadow
+// band (the tube offset toward its cast shadow), because the tonearm's shadow is
+// baked into the photo and, if left in, rotates as a dark "negative" of the arm.
+// Refill is a LOCAL TANGENTIAL BLEND (nearest clear pixel on each side along the
+// same radius) — on a detailed/picture disc this continues the real art instead
+// of the old whole-ring average, which washed out into a visible ghost.
+//   Shadow band knobs (fractions of H, per-photo): arm.shadowOffset (distance to
+//   the shadow), arm.shadowRadius (band half-width; 0 disables), arm.shadowSign
+//   (+1/-1 to flip which side of the tube the shadow is on).
+// Debug: writes out/maskdbg.png — red = fill (arm+shadow), green = pasted arm.
 import Jimp from 'jimp';
 import fs from 'fs';
 import path from 'path';
@@ -77,7 +87,8 @@ function armLike(i) {
   if (bb > gg + 6) return 0;   // cool: purple / navy record art
   if (bb > rr + 6) return 0;   // blue record art
   if (gg > rr + 10) return 0;  // green / teal record art
-  if (sat > 88) return 0;      // vivid red / yellow record art
+  if (sat > 74) return 0;      // saturated record art (incl. warm headwrap pattern)
+  if (rr - gg > 46) return 0;  // strongly red / orange art (e.g. sunset labels) - metal is grayer (r-g small)
   return 1;                    // warm metal: highlight or shadow
 }
 
@@ -144,6 +155,67 @@ function sampleBilinear(x, y) {
   }
   return out;
 }
+// Tangential blend along the radius ring: nearest CLEAR pixel on each side.
+// clearBuf[p] < 0.05 means "usable donor". Returns {rgb, lum} or null.
+function tangBlend(x, y, clearBuf) {
+  const dx = x - cx, dy = y - cy;
+  const rr = Math.hypot(dx, dy);
+  const ang0 = Math.atan2(dy, dx);
+  const step = 0.7 / Math.max(rr, 1);
+  const find = (dir) => {
+    for (let k = 1; k < 6000; k++) {
+      const a2 = ang0 + dir * k * step;
+      const nx = cx + rr * Math.cos(a2);
+      const ny = cy + rr * Math.sin(a2);
+      if (nx < 0 || ny < 0 || nx > W - 1 || ny > H - 1) return null;
+      if (clearBuf[Math.round(ny) * W + Math.round(nx)] < 0.05) return {s: sampleBilinear(nx, ny), d: k};
+    }
+    return null;
+  };
+  const P = find(1), M = find(-1);
+  let rgb = null;
+  if (P && M) {
+    const wP = M.d / (P.d + M.d);
+    rgb = [P.s[0]*wP + M.s[0]*(1-wP), P.s[1]*wP + M.s[1]*(1-wP), P.s[2]*wP + M.s[2]*(1-wP)];
+  } else if (P) rgb = P.s;
+  else if (M) rgb = M.s;
+  if (!rgb) return null;
+  return {rgb, lum: 0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2]};
+}
+
+// ---- geometric shadow band -> add to the FILL mask (not the pasted tonearm).
+// The tonearm's cast shadow is baked into the photo, offset to one side of the
+// tube. Left in, it rotates as a dark "negative" of the arm. We cover it with a
+// band = the tube segment shifted perpendicular toward the shadow, so it gets
+// removed + refilled. shadowOffset/shadowRadius are fractions of H; toward the
+// shadow is the +perp direction of the elbow->head tube. shadowRadius=0 disables.
+const eF = pt(arm.elbow), hF = pt(arm.head);
+let ux = hF[0] - eF[0], uy = hF[1] - eF[1];
+const uL = Math.hypot(ux, uy) || 1; ux /= uL; uy /= uL;
+const px = -uy, py = ux;                         // unit perpendicular (toward shadow)
+const sOff = (arm.shadowOffset ?? 0) * H;
+const sRad = (arm.shadowRadius ?? 0) * H;
+const sSign = (arm.shadowSign ?? 1);
+const eS = [eF[0] + px * sOff * sSign, eF[1] + py * sOff * sSign];
+const hS = [hF[0] + px * sOff * sSign, hF[1] + py * sOff * sSign];
+const fillRaw = new Float32Array(W * H);
+for (let y = 0; y < H; y++) {
+  for (let x = 0; x < W; x++) {
+    const p = y * W + x;
+    let f = alpha[p] >= 0.05 ? 1 : 0;
+    if (sRad > 0) {
+      const dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy <= (r + 2) * (r + 2)) {
+        if (distSeg(x, y, eS, hS) <= sRad) f = 1;
+      }
+    }
+    fillRaw[p] = f;
+  }
+}
+const fillBlur = boxBlur(fillRaw, 2);            // feathered edge for a soft refill
+const fillAlpha = new Float32Array(W * H);
+for (let p = 0; p < W * H; p++) fillAlpha[p] = Math.max(alpha[p], Math.min(1, fillBlur[p] * 1.25));
+
 const vinyl = new Jimp(W, H, 0x00000000);
 const tonearm = new Jimp(W, H, 0x00000000);
 const vd = vinyl.bitmap.data;
@@ -171,30 +243,17 @@ for (let y = 0; y < H; y++) {
     if (edge > 1.5) continue;
     const discA = edge <= 0 ? 1 : 1 - edge / 1.5;
 
+    // Refill uses the WIDER fill mask (arm + its cast shadow) so the shadow is
+    // removed from the spinning disc; the pasted tonearm above stays tight.
+    const mF = fillAlpha[p];
     let rgb = [data[i], data[i + 1], data[i + 2]];
-    if (mA > 0.02) {
-      // Radial average: mean of every CLEAR pixel on the same radius ring.
-      // This is exactly what a fast-spinning record looks like under motion
-      // blur, so the reconstructed strip reads as a smooth part of the disc
-      // instead of a duplicated-feature smear.
-      const ang0 = Math.atan2(dy, dx);
-      const N = 160;
-      let ar = 0, ag = 0, ab = 0, wsum = 0;
-      for (let k = 1; k < N; k++) {
-        const a2 = ang0 + (k / N) * Math.PI * 2;
-        const nx = cx + rr * Math.cos(a2);
-        const ny = cy + rr * Math.sin(a2);
-        if (nx < 0 || ny < 0 || nx > W - 1 || ny > H - 1) continue;
-        if (alpha[Math.round(ny) * W + Math.round(nx)] >= 0.05) continue; // skip arm
-        const s = sampleBilinear(nx, ny);
-        ar += s[0]; ag += s[1]; ab += s[2]; wsum++;
-      }
-      if (wsum > 0) {
-        const avg = [ar / wsum, ag / wsum, ab / wsum];
+    if (mF > 0.02) {
+      const est = tangBlend(x, y, fillAlpha); // donors = clear of arm AND shadow
+      if (est) {
         rgb = [
-          rgb[0] * (1 - mA) + avg[0] * mA,
-          rgb[1] * (1 - mA) + avg[1] * mA,
-          rgb[2] * (1 - mA) + avg[2] * mA,
+          rgb[0] * (1 - mF) + est.rgb[0] * mF,
+          rgb[1] * (1 - mF) + est.rgb[1] * mF,
+          rgb[2] * (1 - mF) + est.rgb[2] * mF,
         ];
       }
     }
@@ -226,3 +285,16 @@ await bg.writeAsync(path.join(pub, 'background.png'));
 await vinyl.writeAsync(path.join(pub, 'vinyl.png'));
 await tonearm.writeAsync(path.join(pub, 'tonearm.png'));
 console.log('Wrote public/background.png, public/vinyl.png, public/tonearm.png');
+
+// --- debug: dump fill mask vs arm mask ---
+{
+  const dbg = new Jimp(W, H, 0x000000ff);
+  const dd = dbg.bitmap.data;
+  for (let p = 0; p < W * H; p++) {
+    const i = p * 4;
+    dd[i] = Math.round(fillAlpha[p] * 255);   // red = fill (arm+shadow)
+    dd[i + 1] = Math.round(alpha[p] * 255);    // green = arm only
+    dd[i + 2] = 0;
+  }
+  await dbg.writeAsync(path.join(root, 'out', 'maskdbg.png'));
+}
